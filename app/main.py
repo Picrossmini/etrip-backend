@@ -14,9 +14,9 @@ from fastapi.responses import JSONResponse
 
 from .errors import AppError, ConflictError
 from .llm_client import DeepSeekClient, get_llm_client
-from .schemas import ItineraryRequest, ItineraryResponse
+from .schemas import ChatRequest, ChatResponse, ItineraryRequest, ItineraryResponse
 from .security import require_token
-from .service import generate_plan
+from .service import chat, generate_plan
 
 app = FastAPI(title="Etrip Backend", version="0.1.0")
 
@@ -97,3 +97,17 @@ def create_itinerary(
         _replay_store[store_key] = result.model_dump(mode="json")
 
     return result
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def create_chat(
+    request: ChatRequest,
+    token: str = Depends(require_token),
+    client: DeepSeekClient = Depends(get_llm_client),
+):
+    """单轮对话补全：拿整段 conversation 换回模型这一条助手消息。
+
+    刻意**不做幂等**：聊天是一问一答地推进，重复提交同一条消息本来就该重新回答，
+    回放上一轮的旧答案反而奇怪。幂等是给「一次性产物」用的（行程生成）。
+    """
+    return chat(request, client)

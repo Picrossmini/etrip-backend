@@ -69,6 +69,11 @@ class ApiClient:
     def upstream_calls(self) -> int:
         return self.stub.state["calls"]
 
+    @property
+    def upstream_prompt(self) -> str:
+        """上游最后一次收到的提示词，用来断言「后端把什么发给了模型」。"""
+        return self.stub.last_prompt()
+
     def post(
         self,
         body,
@@ -127,5 +132,6 @@ def _reset_stub(api):
     """每条用例前把假上游恢复到默认状态，保证互不影响。"""
     api.set_mode("ok")
     api.stub.state["calls"] = 0
+    api.stub.state["last_body"] = None
     yield
     api.set_mode("ok")

@@ -4,12 +4,13 @@
 """
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 
 from .config import Settings, get_settings
 from .errors import UpstreamBadResponse, UpstreamError, UpstreamTimeout
+from .schemas import DEFAULT_MAX_TOKENS
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
@@ -51,22 +52,70 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     raise UpstreamBadResponse("模型返回的 JSON 括号不闭合")
 
 
+def _normalize_message(raw: Any) -> Dict[str, Any]:
+    """把模型回的 assistant message 收成固定形状。
+
+    客户端会把它原样追加进下一轮，所以要保证：
+    - 字段只有 role / content / tool_calls（模型偶尔多塞的字段一律丢掉，
+      否则会被当成 messages 的一部分再发回上游）；
+    - tool_calls 每一项都齐活（id + function.name + function.arguments），
+      客户端拿不到 id 就没法把工具结果关联回去。
+    """
+    if not isinstance(raw, dict):
+        raise UpstreamBadResponse("模型响应里没有 message 对象")
+
+    content = raw.get("content")
+    if content is not None and not isinstance(content, str):
+        raise UpstreamBadResponse("message.content 不是字符串")
+
+    tool_calls = raw.get("tool_calls")
+    normalized: Dict[str, Any] = {
+        "role": str(raw.get("role") or "assistant"),
+        "content": content,
+    }
+
+    if tool_calls:
+        if not isinstance(tool_calls, list):
+            raise UpstreamBadResponse("message.tool_calls 不是数组")
+        calls = []
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                raise UpstreamBadResponse("tool_calls 的元素不是对象")
+            function = item.get("function")
+            if (
+                not item.get("id")
+                or not isinstance(function, dict)
+                or not function.get("name")
+            ):
+                raise UpstreamBadResponse("tool_calls 缺少 id 或 function.name")
+            calls.append(
+                {
+                    "id": str(item["id"]),
+                    "type": str(item.get("type") or "function"),
+                    "function": {
+                        "name": str(function["name"]),
+                        "arguments": str(function.get("arguments") or "{}"),
+                    },
+                }
+            )
+        normalized["tool_calls"] = calls
+
+    if not (content or "").strip() and "tool_calls" not in normalized:
+        raise UpstreamBadResponse("模型既没给出内容，也没有要求调用工具")
+
+    return normalized
+
+
 class DeepSeekClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
 
-    def chat_json(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    def _post(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         settings = self._settings
         if not settings.deepseek_api_key:
             raise UpstreamError("服务端未配置 DEEPSEEK_API_KEY")
 
         url = f"{settings.deepseek_base_url}/chat/completions"
-        payload = {
-            "model": settings.deepseek_model,
-            "messages": messages,
-            "response_format": {"type": "json_object"},
-            "temperature": 0.7,
-        }
         headers = {
             "Authorization": f"Bearer {settings.deepseek_api_key}",
             "Content-Type": "application/json",
@@ -84,12 +133,58 @@ class DeepSeekClient:
             raise UpstreamError(f"模型返回 HTTP {response.status_code}")
 
         try:
-            body = response.json()
+            return response.json()
+        except ValueError as exc:
+            raise UpstreamBadResponse("模型响应不是合法 JSON") from exc
+
+    def chat_json(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """要一段严格 JSON（行程生成用）。"""
+        body = self._post(
+            {
+                "model": self._settings.deepseek_model,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
+                "temperature": 0.7,
+            }
+        )
+
+        try:
             content = body["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
+        except (KeyError, IndexError, TypeError) as exc:
             raise UpstreamBadResponse("模型响应结构异常") from exc
 
         return extract_json_object(content)
+
+    def chat_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> tuple[Dict[str, Any], str]:
+        """要一条普通的助手消息（聊天用）。返回 (message, finish_reason)。
+
+        这里**不做工具循环**：工具（查天气）在客户端执行，循环也在客户端，
+        后端只负责「拿着服务端密钥问一次」。
+        """
+        payload: Dict[str, Any] = {
+            "model": self._settings.deepseek_model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+        }
+        if tools:
+            payload["tools"] = tools
+
+        body = self._post(payload)
+
+        try:
+            choice = body["choices"][0]
+            raw_message = choice["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise UpstreamBadResponse("模型响应结构异常") from exc
+
+        finish_reason = str(choice.get("finish_reason") or "stop")
+        return _normalize_message(raw_message), finish_reason
 
 
 def get_llm_client() -> DeepSeekClient:
