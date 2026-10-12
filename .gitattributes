@@ -1,0 +1,11 @@
+# 统一行尾：仓库里一律按 LF 存（Python 源码尤其别混进 CRLF）。
+# 跟 Etrip 主仓库一个套路，避免 Windows 工作区 CRLF 被误报成「已修改」。
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF，否则可能跑不起来。
+*.bat text eol=crlf
+
+# 二进制，别让 git 做行尾转换。
+*.png binary
+*.jpg binary
+*.ico binary
